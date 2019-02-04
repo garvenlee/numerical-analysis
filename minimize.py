@@ -8,21 +8,29 @@
 '''
 
 import time
-from numpy.linalg import (norm, eigvals)
-from numpy import (arange, meshgrid, diag, array, Inf, shape, mat, delete,
-                   asarray, zeros, random, eye, ones, sqrt, vstack, argmin)
+from numpy.linalg import norm
+from numpy import (array, Inf, delete, random, zeros,
+                   eye, ones, sqrt, hstack, vstack, argmin)
 import matplotlib.pyplot as plt
-from scipy.linalg import inv, solve, qr
+from functools import partial
+from scipy.linalg import inv, qr
 
 eps = 1e-5
 m = 5
-n = 1000
+n = 10
 A = random.randn(m, n)
 A = A.T.dot(A) + 0.01 * eye(n, n)
 c = random.randn(n, 1)
 
 _all = [
-    'steepest_decent', 'conjugate_gradient', 'bfgs', 'newton_CG'
+    'steepest_decent', 'conjugate_gradient',
+    'powell',
+    'linear_newton_CG', 'bfgs', 'lbfgs',
+    'trust_region(cauchy_point,dogleg)',
+    'LM', 'gauss_newton',
+    'active_set', 'null_space', 'lagrange',
+    'feasible_direction', 'rosen',
+    'multiplier_method', 'newton_lagrange', 'SQP'
 ]
 color = ['r', 'b', 'k', 'y', 'g']
 
@@ -48,10 +56,10 @@ def column_name(flag):
             <0:linear search    1:trust region>
     '''
     if flag == 0:
-        print("{0:<6s}{1:^10s}{2:^10s}{3:10s}{4:10s}".format(
+        print("{0:<6s}{1:^10s}{2:^10s}{3:^15s}{4:^15s}".format(
             "iter", "alpha", "norm_dk", "fvalue", "time"))
     else:
-        print("{0:6<s}{1:^10s}{2:^10s}{3:^10s}".format(
+        print("{0:<6s}{1:^10s}{2:^15s}{3:^15s}".format(
             "iter", "norm_dk", "fvalue", "time"))
 
 
@@ -98,6 +106,7 @@ def armijio(f, gk, xk, dk, beta=0.9, sigma=1e-4, maxiter=20):
         sigma: args for armijio (default: {1e-4})
         maxiter: the max iter times (default: {20})
 
+
     Returns:
         [description] the step 'alpha'
         [type] float
@@ -114,7 +123,7 @@ def armijio(f, gk, xk, dk, beta=0.9, sigma=1e-4, maxiter=20):
     return alpha
 
 
-def search_interval(func, start, step_h, gamma, itr=5):
+def search_interval(func, start, step_h, gamma, itr=25):
     '''[精确线性搜索法, 关于alpha的函数,一维函数的最优化问题,目的是寻找出近似的高峰搜索区间 -- 这是alpha的可选区间]
 
     [采用进退法来确定搜索区间,这是一个不需要导数的搜索方法,过程中是已知函数的下降方向,一般取梯度的反方向]
@@ -152,7 +161,7 @@ def search_interval(func, start, step_h, gamma, itr=5):
 
 
 def direct_search(
-        func, a, b, e, al=None, ar=None, lvalue=None, rvalue=None, maxiter=5):
+        func, a, b, e, al=None, ar=None, lvalue=None, rvalue=None, maxiter=25):
     '''[采用 0.618 法在搜索区间寻找局部最优点]
 
     [该方法是一个不依赖于导数的精确线性搜索方法]
@@ -196,12 +205,107 @@ def direct_search(
         ar = None
         lvalue = None
         continue
-    return ar if al is None else al
+    pnt = ar if al is None else al
+    return pnt if pnt < b else (a + b) / 2
+
+
+def q_interpolation(f, a, b, maxiter=25, delta=1e-4, eps=1e-6):
+    '''使用抛物线法二次插值
+
+    Args:
+        f: 单值函数
+        a: 搜索区间左端点
+        b: 搜索区间右端点
+        maxiter: 最大迭代次数 (default: {25})
+        delta: 最小搜索步长 (default: {1e-4})
+        eps: 误差终止数 (default: {1e-6})
+
+    Returns:
+        [description]返回最优搜索点
+        [type]float
+    '''
+    k = 0
+    cond = 0
+    err = 1
+    h = 1
+    s0 = a
+    ds = 1e-5
+    if abs(s0) > 1e-4:
+        h = abs(s0) * 1e-4
+    while k < maxiter and err > eps and not(cond == 5):
+        # 判断当前迭代点 s0 处的斜率走向，确定三点的布局
+        df = (f(s0 + ds) - f(s0 - ds)) / (2 * ds)
+        if df > 0:
+            h = -abs(h)
+        bars = s0
+        s1 = s0 + h
+        s2 = s0 + 2 * h
+        f0 = f(s0)
+        f1 = f(s1)
+        f2 = f(s2)
+        barf = f0
+        cond = 0
+        j = 0
+        # 找到单峰区间
+        while j < maxiter and abs(h) > delta and cond == 0:
+            if f0 <= f1:
+                s2 = s1
+                f2 = f1
+                h = 0.5 * h
+                s1 = s0 + h
+                f1 = f(s1)
+            else:
+                if f2 < f1:
+                    s1 = s2
+                    f1 = f2
+                    h = 2 * h
+                    s2 = s0 + 2 * h
+                    f2 = f(s2)
+                else:
+                    cond = -1
+            j += 1
+            if abs(h) > 1e6 or abs(s0) > 1e6:
+                cond = 5
+        if cond == 5:
+            bars = s1
+            barf = f(s1)
+        else:
+            # 插值更新迭代
+            d = 2 * (2 * f1 - f0 - f2)
+            if d < 0:
+                barh = h * (4 * f1 - 3 * f0 - f2) / d
+            else:
+                barh = h / 3
+                cond = 4
+            bars = s0 + barh
+            barf = f(bars)
+            h = abs(h)
+            h0 = abs(barh)
+            h1 = abs(barh - h)
+            h2 = abs(barh - 2 * h)
+            if h0 < h:
+                h = h0
+            if h1 < h:
+                h = h1
+            if h2 < h:
+                h = h2
+            if h == 0:
+                h = barh
+            if h < delta:
+                cond = 1
+            if abs(h) > 1e6 or abs(bars) > 1e6:
+                cond = 5
+            err = abs(f1 - barf)
+            s0 = bars
+        if cond == 2 and h < delta:
+            cond = 3
+        k += 1
+    return s0 if s0 < b else (a + b) / 2
 
 
 def steepest_decent(f, grad, xk, c1=None, c2=None, beta=None,
                     sigma=None, maxiter=3000, maxiter_linear=None,
-                    exact=False, disp=True,
+                    exact=False, exact_flag=0, disp=True,
                     plot_flag=False, momentum_flag=False,
                     momentum=None):
     '''使用最速梯度下降法求解目标函数的最优解
@@ -218,6 +322,8 @@ def steepest_decent(f, grad, xk, c1=None, c2=None, beta=None,
         maxiter_linear: the max iter times for linear search (default: {None})
         exact: bool value to decide to use exact linear search
             (default:{False})
+        exact_flag: decide to use interpolation or 0.618
+            (default:{0}) <0:q_interpolation, 1:direct_search>
         disp: bool value to decide to print iter info
             (default: {False})    <x:xk[0]  y:f(xk)>
         plot_flag: bool value to decide to plot all points searched
@@ -284,10 +390,14 @@ def steepest_decent(f, grad, xk, c1=None, c2=None, beta=None,
                 else:
                     alpha = armijio(f, gk, xk, dk, maxiter=maxiter_linear)
         else:
-            left, right = search_interval(
-                (lambda alpha: f(xk + alpha * dk)), 0.1, 0.01, 2)
-            alpha = direct_search(
-                (lambda alpha: f(xk + alpha * dk)), left, right, 1e-5)
+            if exact_flag:
+                left, right = search_interval(
+                    (lambda alpha: f(xk + alpha * dk)), 0.1, 0.01, 2)
+                alpha = direct_search(
+                    (lambda alpha: f(xk + alpha * dk)), left, right, 1e-5)
+            else:
+                alpha = q_interpolation(
+                    (lambda alpha: f(xk + alpha * dk)), 0, 1, 1e-5)
 
         if momentum_flag:
             if change_value is None:
@@ -400,13 +510,14 @@ def conjugate_gradient(f, grad, hesse, xk, maxiter=3000,
     return xk
 
 
-def powell(f, xk, maxiter=5, disp=False):
+def powell(f, xk, maxiter=25, maxiter_linear=None, disp=False, err=1e-5):
     '''powell 算法不需要梯度求解凸最优化问题
 
     Args:
         f: object function
         xk: current iter point 'xk'
         maxiter: the max iter times (default: {5})
+        maxiter_linear: the max iter times for linear search (default: {None})
 
     Returns:
         [description] optimum solution
@@ -414,43 +525,58 @@ def powell(f, xk, maxiter=5, disp=False):
     '''
     k = 0
     n = xk.shape[0]
-    Ik = eye(n)
+
+    if maxiter_linear is None:
+        maxiter_linear = 25
 
     if disp:
-        print("{0:<6s}{1:^15s}".format('iter', 'f_value'))
+        begin = time.clock()
+        print("{0:<6s}{1:^15s}{2:^15s}".format('iter', 'f_value', "time"))
 
     while k < maxiter:
+        Ik = eye(n)
         former = xk
-        if disp:
-            fk = f(xk)
         fk = f(xk)
         xpos = []
         xpos.append(xk)
         for i in range(n):
             vk = Ik[i].reshape((n, -1))
             left, right = search_interval(
-                (lambda alpha: f(xpos[i] + alpha * vk)), 0.1, 0.01, 2)
+                (lambda alpha: f(xpos[i] + alpha * vk)), 0, 0.01, 1.1,
+                itr=maxiter_linear)
             alpha = direct_search(
-                (lambda alpha: f(xpos[i] + alpha * vk)), left, right, 1e-5)
+                (lambda alpha: f(xpos[i] + alpha * vk)), left, right,
+                1e-5, maxiter=maxiter_linear)
+            # alpha = q_interpolation(
+            #     (lambda alpha: f(xpos[i] + alpha * vk)), left, right)
+
             xpos.append(xpos[i] + alpha * vk)
-        delete(Ik, 0, 0)
-        vstack((xpos[-1] - xpos[0]).reshape((-1, n)))
+
+        Ik = delete(Ik, 0, 0)
         vk = xpos[-1] - xpos[0]
+        Ik = vstack(((Ik, vk.reshape((-1, n)))))
+
         left, right = search_interval(
-            (lambda alpha: f(xpos[-1] + alpha * vk)), 0.1, 0.01, 2)
+            (lambda alpha: f(xpos[-1] + alpha * vk)), 0, 0.01, 1.1,
+            itr=maxiter_linear)
         alpha = direct_search(
-            (lambda alpha: f(xpos[-1] + alpha * vk)), left, right, 1e-5)
+            (lambda alpha: f(xpos[-1] + alpha * vk)), left, right,
+            1e-5, maxiter=maxiter_linear)
+        # alpha = q_interpolation(
+        #     (lambda alpha: f(xpos[-1] + alpha * vk)), left, right)
         xk = xpos[-1] + alpha * vk
 
         if disp:
-            print('{0:<6d}{1:^15.4f}'.format(k, fk))
+            end = time.clock()
+            print('{0:<6d}{1:^15.4f}{2:^15.5f}'.format(k, fk, end - begin))
 
-        if norm(xk - former) < eps:
+        if abs(f(xk) - fk) < err or abs(norm(xk - former)) < err:
             break
 
         k += 1
 
-    print("共迭代{0}次,最优解为{1:.4f}".format(k, fk))
+    if disp:
+        print("共迭代{0}次,最优解为{1:.4f}".format(k, fk))
     return xk
 
 
@@ -717,7 +843,8 @@ def lbfgs(f, grad, xk, limited_num=None, disp=False,
         [type] col vector
     '''
     n = xk.shape[0]
-    limited_num = int((n)**(1 / 3))
+    if limited_num is None:
+        limited_num = int((n)**(1 / 3))
     cmp = None
     value = None
     Hk0 = eye(n)
@@ -839,7 +966,7 @@ def trust_region(f, grad, hesse, xk, delta=5, max_delta=10, eta=0.05,
 
         if disp:
             end = time.clock()
-            print("{0:<6d}{1:^10.4f}{2:^10.4f}{3:^10.6f}".format(
+            print("{0:<6d}{1:^10.4f}{2:^15.4f}{3:^15.6f}".format(
                 k, norm_gk, fk, end - begin))
 
     print("共迭代{0}次,最优解为{1:.4f}".format(k, fk))
@@ -908,7 +1035,7 @@ def dogleg(f, gk, Bk, delta=5, cg_exact=False, cg_iter=5, grad=None):
 def LM(F, Jacobian, xk, disp=False, maxiter=n, maxiter_linear=None):
     ''' Levenberg-Marquardt 方法求解非线性最小二乘问题
 
-    克服 F(x) 的 Jacobian 矩阵列满秩的缺点
+    克服要求 F(x) 的 Jacobian 矩阵列满秩的缺点
 
     Args:
         F: object function
@@ -970,7 +1097,7 @@ def LM(F, Jacobian, xk, disp=False, maxiter=n, maxiter_linear=None):
         k += 1
         if disp:
             end = time.clock()
-            print("{0:<6d}{1:^10.4f}{2:^10.4f}{3:^10.4f}{4:^10.6f}".format(
+            print("{0:<6d}{1:^10.4f}{2:^10.4f}{3:^15.4f}{4:^15.6f}".format(
                 k, alpha, norm(gk), norm_fk, end - begin))
 
     print("共迭代{0}次,最优解为{1:.4f}".format(k, norm_fk))
@@ -1044,7 +1171,7 @@ def gauss_newton(F, Jacobian, xk, disp=False,
         k += 1
         if disp:
             end = time.clock()
-            print("{0:<6d}{1:^10.4f}{2:^10.4f}{3:^10.4f}{4:^10.6f}".format(
+            print("{0:<6d}{1:^10.4f}{2:^10.4f}{3:^15.4f}{4:^15.6f}".format(
                 k, alpha, norm(gk), norm_rk, end - begin))
 
     print("共迭代{0}次,最优解为{1:.4f}".format(k, norm(rk)))
@@ -1055,7 +1182,8 @@ def active_set(G, c, x0, Ae=None, be=None, Ag=None, bg=None,
                maxiter=100, disp=False):
     '''Active Set Method
 
-    用于求解二次规划问题
+    用于求解二次规划问题 min f(x) = 0.5*x'Gx + c'x
+                    s.t. Aex = be , Agx >= bg
 
     Args:
         G: quadratic matrix
@@ -1263,11 +1391,855 @@ def lagrange(H, c, A, b, disp=False):
     end = time.clock()
 
     if disp:
-        # print("原问题的最优解为:\n")
-        # print(x)
-        # print("对应的乘子向量为:\n")
-        # print(lamda)
+        print("原问题的最优解为:\n")
+        print(x)
+        print("对应的乘子向量为:\n")
+        print(lamda)
         print("花费时间：\n")
         print("{0:.6f}".format(end - begin))
 
     return (x, lamda)
+
+
+def feasible_direction(f, grad, xk, Ag, bg, Ae=None, be=None,
+                       eps=1e-5, maxiter=200, disp=False):
+    '''可行方向法求解线性约束问题
+    在求解线性规划子问题时采用单纯形法的精度会高一些，但是由于目前还没有写出
+    比较完备的单纯形代码，所以用的是罚函数法中的外点法(这里因为内点法对于初始
+    可行点的要求在一般问题中难以达到，且增广拉格朗日乘子法处理线性规划有点
+    小题大做的意味，所以选择效果居中，操作简便的外点法)，但是这样得出的解的
+    误差较大，该函数还有点优化
+
+    min f(x) s.t. Ax >= b , Ex = e ( x_i > 0 )
+
+    Args:
+        f: object function
+        grad: the gradient of object function
+        xk: initial iter point 'xk'
+        Ag: inequality constraints matrix
+        bg: inequality constraints col vector
+        Ae: equality constraints matrix (default: {None})
+        be: equality constraints col vector (default: {None})
+        eps: Allowable error range (default: {1e-5})
+        maxiter: the max iter times (default: {200})
+        disp: bool value to decide to print iter info or not
+             (default: {False})
+
+    Returns:
+        [description] shift of current iter
+        [type] col vector
+    '''
+    def LP(dk, c):
+        return c.T.dot(dk)
+
+    k = 0
+    m, n = Ag.shape
+
+    while k < maxiter:
+        cmp = 0
+        index = zeros((m, 1))
+
+        A = Ag.dot(xk)
+        for i in range(m):
+            if A[i] == bg[i]:
+                index[i] = 1
+                cmp = 1
+        gk = grad(xk)
+
+        if not (be is None) or cmp:
+            if not (be is None):
+                E = Ae
+                e = zeros((Ae.shape[0], 1))
+            else:
+                E = None
+                e = None
+            if cmp:
+                A1 = []
+                b1 = []
+                for row in range(m):
+                    if index[row]:
+                        A1.append(Ag[row])
+                        b1.append(bg[row, 0])
+                # temp_eye = eye(n, n)
+                # temp_ones = ones((n, 1))
+                A1 = array(A1)
+                b1 = array(b1).reshape((-1, 1))
+                # A1 = vstack((A1, temp_eye))
+                # b1 = vstack((b1, -1 * temp_ones))
+                # A1 = vstack((A1, -1 * temp_eye))
+                # b1 = vstack((b1, -1 * temp_ones))
+            else:
+                A1 = None
+                b1 = None
+            objfunc = partial(LP, c=gk)
+            dk_start = 0.1 * ones((n, 1))
+            dk = exterior_point_matrix(
+                objfunc, dk_start, Ae=E, be=e, Ag=A1, bg=b1)
+
+            zk = gk.T.dot(dk)
+            if abs(zk) < eps:
+                break
+
+        else:
+            if norm(gk) < eps:
+                break
+            dk = -gk
+
+        alpha_list = []
+        for i in range(m):
+            if index[i] == 0:
+                Ad = Ag[i].dot(dk)
+                if Ad < 0:
+                    alpha_list.append(float((bg[i] - A[i]) / Ad))
+
+        if len(alpha_list):
+            alpha = min(alpha_list)
+            alpha = direct_search(
+                (lambda s: f(xk + s * dk)), 0, alpha, e=1e-5, maxiter=25)
+        else:
+            left, right = search_interval(
+                (lambda s: f(xk + s * dk)), 0, 1e-4, 1.1, itr=25)
+            alpha = direct_search(
+                (lambda s: f(xk + s * dk)), left, right, e=1e-5, maxiter=25)
+
+        xk = xk + alpha * dk
+        k += 1
+    return xk
+
+
+def rosen(f, grad, xk, Ag, bg,
+          E=None, e=None, maxiter=25, eps=1e-10, disp=False, linear_flag=0):
+    '''梯度投影算法
+
+    主要用于求解线性约束问题 min f(x) s.t. Ax >= b , Ex = e
+
+    Args:
+        f: object function
+        grad: the gradient of object function
+        xk: initial point 'xk'
+        Ag: inequality constraints matrix
+        bg: inequality constraints col vector
+        E: equality constraints matrix(default: {None})
+        e: equality constraints col vector  (default: {None})
+        maxiter: the max iter times (default: {1000})
+        eps: Allowable error range (default: {1e-5})
+        disp: bool value to decide to print iter info (default: {False})
+        linear_flag: decide to use interpolation or direct_search
+            (default: {0})  < 0:q_interpolation, 1:direct_search >
+
+    Returns:
+        [description] shift of current iter
+        [type] col vector
+    '''
+    k = 0
+    m = Ag.shape[0]
+    n = xk.shape[0]
+    length_E = 0
+    xk_former = xk
+
+    if disp:
+        begin = time.clock()
+        column_name(1)
+
+    while k < maxiter:
+        if not (xk_former is xk) or k == 0:
+            M = []
+            index = zeros((m, 1))
+            for i in range(m):
+                if Ag[i].dot(xk) == bg[i]:
+                    index[i] = 1
+                    M.append(list(Ag[i]))
+
+            M = array(M)
+            if not (E is None):
+                length_E = E.shape[0]
+                if M.shape[0]:
+                    M = vstack((M, E))
+                else:
+                    M = E.copy()
+
+        length_A1 = M.shape[0] - length_E
+        if M.shape[0] == 0:
+            P = eye(n, n)
+        else:
+            p = inv(M.dot(M.T)).dot(M)
+            P = eye(n) - M.T.dot(p)
+
+        gk = grad(xk)
+        dk = -P.dot(gk)
+        if norm(dk) < eps:
+            w = (inv(M.dot(M.T)).dot(M)).dot(gk)
+            lamda = w[0:length_A1]
+            cmp = True
+            for i in range(length_A1):
+                if lamda[i] < 0:
+                    M = delete(M, i, 0)
+                    cmp = False
+                    break
+            if cmp:
+                break
+            else:
+                xk_former = xk
+
+        else:
+            alpha_list = []
+            for i in range(m):
+                if index[i] == 0:
+                    t = Ag[i].dot(dk)
+                    if t < 0:
+                        alpha_list.append(float((bg[i] - Ag[i].dot(xk)) / t))
+            if len(alpha_list):
+                alpha_ba = min(alpha_list)
+            else:
+                alpha_ba = 1
+
+            if linear_flag == 0:
+                alpha = q_interpolation(
+                    (lambda alpha: f(xk + alpha * dk)), 0, alpha_ba,
+                    maxiter=25)
+                alpha = alpha_ba if alpha > alpha_ba else alpha
+            else:
+                alpha = direct_search(
+                    (lambda alpha: f(xk + alpha * dk)), 0, alpha_ba, eps,
+                    maxiter=25)
+
+            xk_former = xk
+            xk = xk + alpha * dk
+            if norm(xk - xk_former) < eps:
+                break
+
+        k += 1
+        if disp:
+            end = time.clock()
+            print("{0:<6d}{1:^10.5f}{2:^15.5f}{3:^15.6f}".format(
+                k, norm(gk), f(xk), end - begin))
+
+    if disp:
+        print("最优解是：")
+        print(xk)
+        print("最优解处的函数值是：")
+        print(f(xk))
+
+    return xk
+
+
+def exterior_point_matrix(f, xk, Ae=None, be=None, Ag=None, bg=None,
+                          mu=None, ita=8, maxiter=25, eps=1e-5, disp=False):
+    '''外点法求解线性矩阵约束问题的版本
+
+    min f(x) s.t. Aex=be , Agx >= bg (x_i >= 0)
+
+    Args:
+        f: object function
+        xk: initial iter point 'xk'
+        Ae: equality constraints matrix (default: {None})
+        be: equality constraints col vector (default: {None})
+        Ag: inequality constraints matrix (default: {None})
+        bg: inequality constraints col vector (default: {None})
+        mu: penalty parameters (default: {None})
+        ita: args to change penalty parameters (default: {0.45})
+        maxiter: the max iter times (default: {25})
+        eps: Allowable error range (default: {1e-5})
+        disp: bool value to decide to print iter info or not
+             (default: {False})
+
+    Returns:
+        [description] 用一般约束问题版本函数处理
+        [type] funciton
+    '''
+    def constraints_func(xk, A, b):
+        return A.dot(xk) - b
+
+    if not (Ae is None):
+        equality = partial(constraints_func, A=Ae, b=be)
+    else:
+        equality = None
+    if not (Ag is None):
+        greater = partial(constraints_func, A=Ag, b=bg)
+    else:
+        greater = None
+    return exterior_point(f, xk, h=equality, g=greater,
+                          mu=mu, ita=ita, maxiter=maxiter, eps=eps, disp=disp)
+
+
+def exterior_point(f, xk, h=None, g=None,
+                   mu=None, ita=8, maxiter=25, eps=1e-5, disp=False):
+    '''外点法求解一般约束优化问题
+    外点法相对于内点法而言，对初始迭代点没有要求，且在处理小规模问题时，近似解的
+    误差还算是能够接受的
+
+    min f(xk) s.t. h(x) = 0 , g(x) >= 0
+
+    Args:
+        f: object function
+        xk: initial iter point 'xk'
+        h: equality constraints (default: {None})
+        g: inequality constraints (default: {None})
+        mu: penalty parameters (default: {None})
+        ita: args to change penalty parameters (default: {0.45})
+        maxiter: the max iter times (default: {25})
+        eps: Allowable error range  (default: {1e-5})
+        disp: bool value to decide to print iter info or not
+            (default: {False})
+
+    Returns:
+        [description] shift of current iter
+        [type] col vector
+    '''
+    def penalty(xk, f, mu, h=None, g=None):
+        '''构建外点法的无约束最优化模型
+
+        P(x) = f(x) + mu * [ sum h_i(x)**2 +  sum min(0 , g_i(x))**2 ]
+
+        Args:
+            xk: current iter point 'xk'
+            f: object function
+            mu: penalty parameter
+            h: equality constraints (default: {None})
+            g: inequality constraints (default: {None})
+
+        Returns:
+            [description] 返回目标函数对应约束条件的罚函数模型在xk处的值
+            [type] number
+        '''
+        fk = f(xk)
+        sum_h = 0
+        sum_g = 0
+        if not (h is None):
+            hk = h(xk)
+            mh = hk.shape[0]
+            for row in range(mh):
+                sum_h += hk[row, 0]**2
+        if not (g is None):
+            gk = g(xk)
+            mg = gk.shape[0]
+            for row in range(mg):
+                sum_g += min(0, gk[row, 0])**2
+        return fk + mu * (sum_h + sum_g)
+
+    k = 0
+    n = xk.shape[0]
+
+    if disp:
+        begin = time.clock()
+        print("{0:<6s}{1:^15s}{2:^15s}".format(
+            "iter", "fvalue", "time"))
+
+    if mu is None:
+        mu = 0.1
+    while k < maxiter:
+        minimize_obj = partial(penalty, f=f, mu=mu, h=h, g=g)
+        xk = powell(minimize_obj, xk, maxiter=15 * n)
+        mu *= ita
+        if norm(minimize_obj(xk) - f(xk)) < eps:
+            break
+        k += 1
+
+        if disp:
+            end = time.clock()
+            print("{0:<6d}{1:^15.4f}{2:^15.6f}".format(
+                k, f(xk), end - begin))
+    if disp:
+        print("最优解为：", f(xk))
+        print("最优点为：")
+        print(xk)
+    return xk
+
+
+def interior_point_matrix(f, xk, Ae=None, be=None, Ag=None, bg=None,
+                          mu=None, ita=0.45,
+                          maxiter=25, eps=1e-5, disp=False):
+    '''内点法求解线性矩阵约束问题的版本
+
+    min f(x) s.t. Aex=be , Agx >= bg (x_i >= 0)
+
+    Args:
+        f: object function
+        xk: initial iter point 'xk'
+        Ae: equality constraints matrix (default: {None})
+        be: equality constraints col vector (default: {None})
+        Ag: inequality constraints matrix (default: {None})
+        bg: inequality constraints col vector (default: {None})
+        mu: penalty parameters (default: {None})
+        ita: args to change penalty parameters (default: {0.45})
+        maxiter: the max iter times (default: {25})
+        eps: Allowable error range (default: {1e-5})
+        disp: bool value to decide to print iter info or not
+             (default: {False})
+
+    Returns:
+        [description] 用一般约束问题版本函数来处理
+        [type] function
+    '''
+    def constraints_func(xk, A, b):
+        return A.dot(xk) - b
+
+    if not (Ae is None):
+        equality = partial(constraints_func, A=Ae, b=be)
+    else:
+        equality = None
+    if not (Ag is None):
+        greater = partial(constraints_func, A=Ag, b=bg)
+    else:
+        greater = None
+    return interior_point(f, xk, h=equality, g=greater,
+                          mu=mu, ita=ita, maxiter=maxiter, eps=eps, disp=disp)
+
+
+def interior_point(f, xk, h=None, g=None,
+                   mu=None, ita=0.45, maxiter=25, eps=1e-5, disp=False):
+    '''内点法求解一般约束优化问题
+    内点法的致命缺点是严格初始可行点的选择，且内点法对于参数十分敏感，
+    经常得不到理想精度下的解
+
+    min f(xk) s.t. h(x) = 0 , g(x) >= 0
+
+    Args:
+        f: object function
+        xk: initial iter point 'xk'
+        h: equality constraints (default: {None})
+        g: inequality constraints (default: {None})
+        mu: penalty parameters (default: {None})
+        ita: args to change penalty parameters (default: {0.45})
+        maxiter: the max iter times (default: {25})
+        eps: Allowable error range  (default: {1e-5})
+        disp: bool value to decide to print iter info or not
+            (default: {False})
+
+    Returns:
+        [description] shift of current iter
+        [type] col vector
+    '''
+    def penalty(xk, f, mu, h=None, g=None):
+        '''构建内点法的无约束最优化模型
+
+        P(x) = f(x) + 1/(2*mu) * sum h_i(x) + mu * sum [ 1. / g_i(x) ]
+
+        Args:
+            xk: current iter point 'xk'
+            f: object function
+            mu: penalty parameter
+            h: equality constraints (default: {None})
+            g: inequality constraints (default: {None})
+
+        Returns:
+            [description] 返回目标函数对应约束条件的罚函数模型在xk处的值
+            [type] number
+        '''
+        fk = f(xk)
+        sum_h = 0
+        sum_g = 0
+        if not (h is None):
+            hk = h(xk)
+            mh = hk.shape[0]
+            for row in range(mh):
+                sum_h += hk[row, 0]**2
+        if not (g is None):
+            gk = g(xk)
+            mg = gk.shape[0]
+            for row in range(mg):
+                if gk[row, 0]:
+                    sum_g += 1. / gk[row, 0]
+                else:
+                    sum_g += 1e5
+        return fk + 1. / (2 * mu) * sum_h + mu * sum_g
+
+    def cal_mu(f_value, g_value):
+        '''动态初始罚参数值
+
+        mu = f(xk) / [1 / sum g_i(xk)]
+
+        Args:
+            f_value: value of object function at 'xk'
+            g_value: value of inequality constraints at 'xk'
+
+        Returns:
+            [description] 返回初始罚参数值
+            [type] float
+        '''
+        if f_value:
+            m = g_value.shape[0]
+            sum_g = 0
+            for row in range(m):
+                if g_value[row, 0]:
+                    sum_g += 1. / g_value[row, 0]
+                else:
+                    sum_g += 1e5
+            if sum_g:
+                mu = abs(f_value / sum_g)
+            else:
+                mu = 50
+        else:
+            mu = 50
+        return mu
+
+    k = 0
+
+    if disp:
+        begin = time.clock()
+        print("{0:<6s}{1:^15s}{2:^15s}".format(
+            "iter", "fvalue", "time"))
+    n = xk.shape[0]
+    if mu is None:
+        fk = f(xk)
+        gk = g(xk)
+        mu = cal_mu(fk, gk)
+    while k < maxiter:
+
+        minimize_obj = partial(penalty, f=f, h=h, g=g, mu=mu)
+        xk = powell(minimize_obj, xk, maxiter=20 * n)
+        mu *= ita
+
+        if minimize_obj(xk) - f(xk) < eps or mu < eps:
+            break
+        k += 1
+        if disp:
+            end = time.clock()
+            print("{0:<6d}{1:^15.4f}{2:^15.6f}".format(
+                k, f(xk), end - begin))
+    if disp:
+        print("最优解为：", f(xk))
+        print("最优点为：")
+        print(xk)
+    return xk
+
+
+def augmented_lagrange(xk, f, h=None, g=None, mu=None,
+                       lamda=None, sigma=None):
+    '''构建增广拉格朗日函数
+
+    如果得定等式约束 h，那么一定要给定参数 mu
+    如果给定不等式约束 g，那么一定要给定参数 lamda
+
+    Args:
+        xk: current iter point 'xk'
+        f: object function
+        h: equality constraints (default: {None})
+        g: inequality constraints (default: {None})
+        mu: multiplier vector for equality constraints (default: {None})
+        lamda: multiplier vector for revised inequality constraints
+            (default: {None})
+        sigma: penalty parameters (default: {None})
+
+    Returns:
+        [description]augmented_lagrange function at 'xk'
+        [type] float
+    '''
+    fk = f(xk)
+    if not(h is None):
+        hk = h(xk)
+        sum_hi_2 = 0.5 * sigma * norm(hk)**2
+        sum_hi = mu.T.dot(hk)
+    else:
+        sum_hi_2 = 0
+        sum_hi = 0
+
+    if not(g is None):
+        gk = g(xk)
+        sum_gi = 0
+        m = gk.shape[0]
+
+        for i in range(m):
+            sum_gi += min(0, float(sigma * gk[i] - lamda[i]))**2 - lamda[i]**2
+        sum_gi = 0.5 * sum_gi / sigma
+    else:
+        sum_gi = 0
+
+    return float(fk - sum_hi + sum_hi_2 + sum_gi)
+
+
+def multiplier_method_matrix(f, xk, Ae=None, be=None, Ag=None, bg=None,
+                             mu=None, lamda=None, sigma=None,
+                             maxiter=25, eps=1e-5,
+                             ita=0.5, aita=2.0, disp=False):
+    '''增广拉格朗日方法对于求解线性矩阵约束的版本
+
+    Args:
+        f: object function
+        xk: initial iter point 'xk'
+        Ae: equality constraints matrix (default: {None})
+        be: equality constraints col vector (default: {None})
+        Ag: inequality constraints matrix (default: {None})
+        bg: inequality constraints col vector (default: {None})
+        mu: multiplier vector for equlity constraints (default: {None})
+        lamda: multiplier vector for inequality constraints (default: {None})
+        sigma: penalty parameters (default: {None})
+        maxiter: the max iter times (default: {25})
+        eps: Allowable error range (default: {1e-5})
+        ita: args to decide to change sigma or not (default: {0.8})
+        aita: args for changing sigma (default: {2.0})
+        disp: bool value to decide to print iter info (default: {False})
+
+    Returns:
+        [description] shift of current iter
+        [type] col vector
+    '''
+    def constraints_func(xk, A, b):
+        return A.dot(xk) - b
+
+    if not (Ae is None):
+        equality = partial(constraints_func, A=Ae, b=be)
+    else:
+        equality = None
+    if not (Ag is None):
+        greater = partial(constraints_func, A=Ag, b=bg)
+    else:
+        greater = None
+    return multiplier_method(f, xk, h=equality, g=greater,
+                             mu=mu, lamda=lamda, sigma=sigma,
+                             maxiter=maxiter, eps=eps,
+                             ita=ita, aita=aita, disp=disp)
+
+
+def multiplier_method(f, xk, h=None, g=None, mu=None, lamda=None, sigma=None,
+                      maxiter=25, eps=1e-5, ita=0.45, aita=1.1, disp=False):
+    '''使用增广拉格朗日算法求解非线性约束问题
+
+    主要用于求解 min f(x) s.t. h(x) = 0 , g(x) >= 0
+    增广拉格朗日函数为 G(x) = f(x) - Sum mu_i*h_i(x) +
+        0.5*sigma * Sum h_i(x)^2 + (1/2*sigma)*Sum (min{0,
+        sigma*g_i(x)-lamda_i}^2-lamda_i^2)
+
+    Args:
+        f: object function
+        h: equality constraints(vector valued  function)
+        g: inequality constraints(vector valued  function)
+        xk: initial iter point 'xk'
+        mu: multiplier vector for equality contraints  (default: {None})
+        lamda: multiplier vector for revised inequality contraints
+         (default: {None})
+        sigma: penalty parameters (default: {None})
+        maxiter: the max iter times (default: {1000})
+        eps: Allowable error range (default: {1e-5})
+        ita: args to decide to change sigma or not (default: {0.8})
+        aita: args for changing sigma (default: {2.0})
+        disp: bool value to decide to print iter info (default: {False})
+
+    Returns:
+        [description] shift of current iter
+        [type] col vector
+    '''
+    k = 0
+    beta_ = 0
+    n = xk.shape[0]
+    if not(h is None):
+        hk = h(xk)
+        m = hk.shape[0]
+
+    if not(g is None):
+        gk = g(xk)
+        s = gk.shape[0]
+
+    if disp:
+        begin = time.clock()
+        print("{0:<6s}{1:^15s}{2:^15s}".format(
+            "iter", "fvalue", "time"))
+
+    if mu is None and not(h is None):
+        mu = 0.1 * ones((m, 1))
+    if lamda is None and not(g is None):
+        lamda = 0.1 * ones((s, 1))
+    if sigma is None:
+        sigma = 1.1
+
+    while k < maxiter:
+        penalty = partial(augmented_lagrange, f=f, h=h, g=g,
+                          mu=mu, lamda=lamda, sigma=sigma)
+        if not(g is None):
+            xk = powell(penalty, xk, maxiter=20 * n)
+            if not(h is None):
+                hk = h(xk)
+                beta = sum(hk**2)
+            else:
+                beta = 0
+
+            gk = g(xk)
+            m = gk.shape[0]
+            for i in range(m):
+                beta += min(gk[i], float(lamda[i] / sigma))**2
+            beta = sqrt(beta)
+            if beta < eps:
+                break
+            else:
+                if beta > ita * beta_:
+                    sigma = aita * sigma
+                if not(h is None):
+                    mu = mu - sigma * hk
+                for i in range(m):
+                    lamda[i] = max(0, lamda[i] - gk[i])
+
+            beta_ = beta
+        elif not(h is None) and g is None:
+            hk = h(xk)
+            norm_hk = norm(hk)
+            xk = powell(penalty, xk, maxiter=20 * n)
+            hk_1 = h(xk)
+            norm_hk_1 = norm(hk_1)
+            if norm_hk_1 < eps:
+                break
+            else:
+                if norm_hk_1 >= ita * norm_hk:
+                    sigma = aita * sigma
+                mu = mu - sigma * hk_1
+
+        else:
+            xk = powell(f, xk, disp=disp)
+            break
+
+        k += 1
+
+        if disp:
+            fk = f(xk)
+            end = time.clock()
+            print("{0:<6d}{1:^15.4f}{2:^15.6f}".format(
+                k, fk, end - begin))
+
+    if disp:
+        print("最优解为：")
+        print(xk)
+        print("最优值为：")
+        print(f(xk))
+    return (xk, mu, lamda)
+
+
+def newton_lagrange(f, h, df, dh, d2f, d2h, xk, mu, maxiter=1000,
+                    eps=1e-5, rho=0.5, gamma=0.4, disp=False):
+    '''基于牛顿下降的lagrange算法求解一般等式约束问题
+    此算法的致命缺点是要不断地计算梯度与 hesse 阵,
+    首先是梯度与 hesse 阵的计算是否容易，其次是要保证 hesse 阵正定
+    如果采用 CG 算法求解牛顿问题，保证精确但耗时严重，不精确但结果误差大
+
+    min f(x) s.t. h(x) = 0
+
+    Args:
+        f: object function
+        h: equality constraints
+        df: the gradients of object function
+        dh: the gradients of equality constraints
+        d2f: the hesse matrix of object function
+        d2h: the hesse matrix of equality constrains
+        xk: initial iter point 'xk'
+        mu: multiplier vector for equality constraints
+        maxiter: the max iter times (default: {1000})
+        eps: Allowable error range (default: {1e-5})
+        rho: args for end (default: {0.5})
+        gamma: args for end [description] (default: {0.4})
+        disp: bool value to decide to print iter info or not
+             (default: {False})
+
+    Returns:
+        [description] shift of current iter
+        [type] col vector
+    '''
+    def f_lagrange(xk, mu):
+        '''lagrange 函数
+
+        L(x,mu) = f(x) - mu.T.dot(h(x))
+
+        Args:
+            xk: current iter point 'xk'
+            mu: multiplier vector
+
+        Returns:
+            [description] 返回 lagrange 函数在 xk 处的值
+            [type] number
+        '''
+        return float(f(xk) - mu.T.dot(h(xk)))
+
+    def df_lagrange(xk, mu):
+        '''返回 lagrange 函数的梯度向量
+
+        Args:
+            xk: current iter point 'xk'
+            mu: multiplier vector
+
+        Returns:
+            [description] 返回 lagrange 函数在当前点 xk 处的梯度
+            [type] col vector
+        '''
+        return vstack((df(xk) - dh(xk).dot(mu), -h(xk)))
+
+    def d2f_lagrange(xk, mu):
+        '''返回 lagrange 函数的 hesse matrix
+
+        Args:
+            xk: current iter point 'xk'
+            mu: multiplier vector
+
+        Returns:
+            [description] 返回 lagrange 函数在当前点 xk 处的 hesse 矩阵
+            [type] matrix
+        '''
+        d2h_matrix = d2h(xk)
+        m = len(d2h_matrix)
+        dw = d2f(xk)
+        dh_matrix = dh(xk)
+        for i in range(m):
+            dw = dw - float(mu[i]) * d2h_matrix[i]
+
+        return vstack((hstack((dw, -dh_matrix)), hstack((-dh_matrix.T, zeros((
+            dh_matrix.shape[1], dh_matrix.shape[1]))))))
+
+    k = 0
+    m = xk.shape[0]
+
+    while k < maxiter:
+        dl_matrix = df_lagrange(xk, mu)
+        norm_dl_matrix = norm(dl_matrix)
+        if norm_dl_matrix < eps:
+            break
+        d2l_matrix = d2f_lagrange(xk, mu)
+        # dk_vk = CG_modification(d2l_matrix, dl_matrix, maxiter=10)
+        dk_vk = -inv(d2l_matrix).dot(dl_matrix)
+        dk = dk_vk[0:m, :]
+        vk = dk_vk[m:, :]
+        dl_1_maxtrix = df_lagrange(xk + dk, mu + vk)
+        if norm(dl_1_maxtrix)**2 <= (1 - gamma) * norm_dl_matrix**2:
+            alpha = 1
+        else:
+            j = 0
+            p = 0
+            while j < 20:
+                beta = rho**p
+                if norm(df_lagrange(xk + beta * dk, mu + beta * vk))**2 \
+                        > (1 - gamma * beta) * norm_dl_matrix**2:
+                    p += 1
+                else:
+                    break
+                j += 1
+            alpha = beta
+        xk = xk + alpha * dk
+        mu = mu + alpha * vk
+        k += 1
+    return xk
+
+
+def Simplex(c, Ae, be):
+
+    m, n = Ae.shape
+    S = hstack((c.T, array([[0]])))
+    S = vstack((S, hstack((Ae, be))))
+    for i in range(1, m + 1):
+        S[i] = S[i] / S[i, i - 1]
+        for j in range(i + 1, m + 1):
+            S[j] = S[j] - S[i] * S[j, i - 1]
+    for i in range(m - 1):
+        for j in range(m - i - 1):
+            S[m - i - j - 1] = S[m - i - j - 1] - \
+                S[m - i - j - 1, m - i - 1] * S[m - i]
+    for i in range(m):
+        S[0] = S[0] - S[0, i] * S[i + 1]
+
+    d_check = (S[0, m], m)
+    for i in range(n - m):
+        d_check = (S[0, i + m], m + i) if S[0, i + m] > d_check[0] else d_check
+
+    if d_check[0] <= 0:
+        return S[:, -1]
+    else:
+        A = S[:, d_check[1]]
+        t = S.shape[1]
+        r = array([max(float(be[i] / A[i]), 0) for i in range(t)])
+        r_min = min(r)
+        idx = argmin(r)
+        S[idx, :] = S[idx, :] / r_min
